@@ -30,6 +30,9 @@ from pycel.excelutil import (
     is_address,
     iterative_eval_tracker,
     list_like,
+    MAX_COL,
+    MAX_ROW,
+    SPILL_ERROR,
 )
 from pycel.excelwrapper import ExcelOpxWrapper, ExcelOpxWrapperNoData
 
@@ -92,6 +95,17 @@ class ExcelCompiler:
         self.conditional_formats = {}
         self._formula_cells_dict = {}
         self._plugin_modules = plugins
+
+        # Dynamic array spill bookkeeping (e.g. SEQUENCE)
+        # spill_map:   anchor address -> addresses the anchor spilled to
+        # spill_owners: spilled address -> owning anchor address
+        # both maps only ever contain plain address strings
+        self.spill_map = {}
+        self.spill_owners = {}
+        # anchors currently being resolved, to guard against recursion
+        self._spill_resolving = set()
+        # cached dynamic array anchor addresses per workbook sheet
+        self._dynamic_anchor_cache = {}
 
         # Setup to be able to evaluate circular references
         self.cycles = cycles
@@ -201,6 +215,12 @@ class ExcelCompiler:
                  for addr, cell in self.cell_map.items() if cell.serialize),
                 key=lambda x: AddressRange(x[0]).sort_key
             )),
+            # dynamic array spill ownership, spilled values ride along
+            # in the cell_map above as plain cell values
+            spill_map={
+                anchor: list(spilled)
+                for anchor, spilled in self.spill_map.items()
+            },
             # serialize the workbook filename (not the serialization path)
             filename=self.filename,
         ))
@@ -269,6 +289,9 @@ class ExcelCompiler:
 
         excel_compiler._process_gen_graph()
         del data['cell_map']
+
+        # restore dynamic array spill ownership
+        excel_compiler._restore_spills(data.pop('spill_map', None))
 
         # process the rest of the data from the file
         excel_compiler._excel_file_md5_digest = data['excel_hash']
@@ -460,9 +483,29 @@ class ExcelCompiler:
             # set the value
             cell_or_range.value = value
 
+        # maintain dynamic array spill invariants on user writes
+        if not self.cycles:
+            self._note_cell_value_set(cell_or_range, address)
+            self._recalc_reset_dynamic_arrays()
+
+    def _recalc_reset_dynamic_arrays(self):
+        """Re-evaluate dynamic array anchors invalidated by a set_value"""
+        for a_cell in tuple(self.cell_map.values()):
+            if not isinstance(a_cell, _Cell):
+                continue
+            if a_cell.formula is None or not a_cell.needs_calc:
+                continue
+            if self._is_dynamic_formula(a_cell):
+                self._evaluate(str(a_cell.address))
+
     def _reset(self, cell):
         if cell.needs_calc:
             return
+
+        # a resetting dynamic array anchor releases its spilled cells
+        if isinstance(cell, _Cell) and str(cell.address) in self.spill_map:
+            self._clear_spill(cell)
+
         self.log.info(f"Resetting {cell.address}")
         cell.value = None
 
@@ -491,11 +534,18 @@ class ExcelCompiler:
 
     def recalculate(self):
         """Recalculate all of the known cells"""
+        # release all dynamic array spill regions, they are re-established
+        # when their anchors are evaluated below
+        for anchor_address in tuple(self.spill_map):
+            anchor_cell = self.cell_map.get(anchor_address)
+            if anchor_cell is not None:
+                self._clear_spill(anchor_cell)
+
         for cell in self.cell_map.values():
             if isinstance(cell, _CellRange) or cell.formula:
                 cell.value = None
 
-        for cell in self.cell_map.values():
+        for cell in tuple(self.cell_map.values()):
             self.evaluate(cell.address.address)
 
     def trim_graph(self, input_addrs, output_addrs):
@@ -832,10 +882,331 @@ class ExcelCompiler:
                 else:
                     self.log.info(
                         f"Cell {cell.address} evaluated to '{value}' ({type(value).__name__})")
-                cell.value = (value[0][0] if list_like(value[0]) else value[0]
-                              ) if list_like(value) else value
+
+                # a multi cell array result spills to the neighboring cells
+                cell.value = self._apply_spill(cell, value)
+
+            elif cell.formula is None:
+                # an empty cell may be the spill target of a dynamic array
+                # formula anchored up and to the left of it
+                self._discover_spill(cell)
 
         return cell.value
+
+    # ------------------------------------------------------------------
+    # Dynamic array spill support (e.g. SEQUENCE)
+    #
+    # A formula whose final result is a rectangular array "spills": the
+    # anchor cell keeps the top left element and the other elements are
+    # written to the cells immediately right of and below the anchor.
+    # spill_map maps anchor address -> spilled cell addresses, while
+    # spill_owners is the reverse mapping.
+    # ------------------------------------------------------------------
+
+    def _apply_spill(self, cell, value):
+        """Spill a multi cell formula result, return the anchor value"""
+        if list_like(value):
+            if not len(value):
+                self._clear_spill(cell)
+                cell.spill_shape = None
+                return None
+
+            if not list_like(value[0]):
+                # normalize a one dimensional array to a single row
+                value = (tuple(value), )
+
+            nrows = len(value)
+            ncols = len(value[0])
+            if nrows == 1 and ncols == 1:
+                self._clear_spill(cell)
+                cell.spill_shape = None
+                return value[0][0]
+
+            return self._spill_array(cell, value, nrows, ncols)
+
+        # a scalar result releases any previous spill
+        self._clear_spill(cell)
+        cell.spill_shape = None
+        return value
+
+    def _spill_array(self, cell, data, nrows, ncols):
+        anchor = cell.address
+        anchor_addr = str(anchor)
+
+        # remember the desired extent even if the spill is blocked, so a
+        # later edit inside the area can re-evaluate the anchor
+        cell.spill_shape = (nrows, ncols)
+
+        end_col_idx = anchor.col_idx + ncols - 1
+        end_row = anchor.row + nrows - 1
+        if end_col_idx > MAX_COL or end_row > MAX_ROW:
+            self.log.info(f"Spill blocked for {anchor}: runs off the sheet")
+            self._clear_spill(cell)
+            return SPILL_ERROR
+
+        target_rows = AddressRange(
+            (anchor.col_idx, anchor.row, end_col_idx, end_row),
+            sheet=anchor.sheet).resolve_range
+
+        # the spill area (other than the anchor) must be empty
+        for target in flatten(target_rows):
+            target_addr = str(target)
+            if target_addr == anchor_addr:
+                continue
+            target_cell = self._ensure_spill_cell(target_addr)
+            owner = self.spill_owners.get(target_addr)
+            has_formula = target_cell.formula is not None
+            has_value = target_cell.value is not None
+            owned_elsewhere = owner != anchor_addr
+            if has_formula or (has_value and owned_elsewhere):
+                self.log.info(
+                    f"Spill blocked for {anchor}: {target_addr} is occupied")
+                self._clear_spill(cell)
+                return SPILL_ERROR
+
+        # release any previous spill before writing the new region
+        self._clear_spill(cell)
+
+        spilled = []
+        for row_idx, row in enumerate(target_rows):
+            for col_idx, target in enumerate(row):
+                target_addr = str(target)
+                if target_addr == anchor_addr:
+                    continue
+                target_cell = self._ensure_spill_cell(target_addr)
+                new_value = data[row_idx][col_idx]
+                if target_cell.value != new_value:
+                    # formulas depending on this cell must drop stale values
+                    self._invalidate_dependents(target_cell)
+                target_cell.spill_owner = anchor_addr
+                target_cell.value = new_value
+                self.spill_owners[target_addr] = anchor_addr
+                spilled.append(target_addr)
+
+        self.spill_map[anchor_addr] = tuple(spilled)
+        self.log.info(f"Cell {anchor} spilled to {len(spilled)} cells")
+        return data[0][0]
+
+    def _clear_spill(self, anchor_cell):
+        """Empty all cells this anchor previously spilled to"""
+        anchor_addr = str(anchor_cell.address)
+        spilled = self.spill_map.pop(anchor_addr, ())
+        for target_addr in spilled:
+            self.spill_owners.pop(target_addr, None)
+            target_cell = self.cell_map.get(target_addr)
+            if target_cell is None:
+                continue
+            target_cell.spill_owner = None
+            if target_cell.value is not None:
+                # reset so formulas depending on the spilled value follow
+                self._reset(target_cell)
+
+    def _ensure_spill_cell(self, target_addr):
+        if target_addr not in self.cell_map:
+            self._gen_graph(target_addr)
+        return self.cell_map[target_addr]
+
+    def _invalidate_dependents(self, cell):
+        """Reset formulas with cached values that depend on this cell"""
+        if cell in self.dep_graph:
+            for child_cell in self.dep_graph.successors(cell):
+                if child_cell.value is not None:
+                    self._reset(child_cell)
+
+    def _discover_spill(self, cell):
+        """Find a dynamic array anchor which spills onto this empty cell"""
+        target_addr = str(cell.address)
+        if target_addr in self.spill_owners:
+            return
+
+        for anchor_addr in self._spill_candidates(cell.address):
+            if anchor_addr in self._spill_resolving:
+                continue
+            self._spill_resolving.add(anchor_addr)
+            try:
+                self._evaluate(anchor_addr)
+            finally:
+                self._spill_resolving.discard(anchor_addr)
+            if target_addr in self.spill_owners:
+                return
+
+    def _spill_candidates(self, target):
+        """Dynamic array formula cells above-left of `target`"""
+        candidates = {}
+
+        def add(a_cell):
+            if a_cell is None or a_cell.formula is None:
+                return
+            address = a_cell.address
+            if address.sheet != target.sheet:
+                return
+            if address.row > target.row or address.col_idx > target.col_idx:
+                return
+            anchor_addr = str(address)
+            if anchor_addr == str(target):
+                return
+            if self._is_dynamic_formula(a_cell):
+                candidates[anchor_addr] = (
+                    target.row - address.row,
+                    target.col_idx - address.col_idx,
+                )
+
+        for a_cell in self.cell_map.values():
+            if isinstance(a_cell, _Cell):
+                add(a_cell)
+
+        # dynamic formula cells may not have been built into the cell map
+        # yet, look directly in the underlying workbook when available
+        excel = getattr(self, 'excel', None)
+        workbook = getattr(excel, 'workbook', None)
+        if workbook is not None and target.sheet in workbook.sheetnames:
+            for anchor_addr in self._workbook_dynamic_anchors(target.sheet):
+                formula_cell = AddressRange(anchor_addr).start
+                if formula_cell.row > target.row:
+                    continue
+                if formula_cell.col_idx > target.col_idx:
+                    continue
+                if anchor_addr not in self.cell_map:
+                    self._gen_graph(anchor_addr)
+                add(self.cell_map.get(anchor_addr))
+
+        # nearest anchor first
+        return tuple(sorted(candidates, key=lambda a: candidates[a]))
+
+    def _workbook_dynamic_anchors(self, sheet):
+        """Addresses of dynamic array formulas in a workbook sheet
+
+        Workbook formulas never change over the lifetime of a compiler,
+        so the scan is cached.  The sparse openpyxl ``_cells`` mapping is
+        used when available: merely accessing a far away cell inflates
+        ``max_row`` and makes a plain ``iter_rows`` scan touch millions
+        of empty rows.
+        """
+        cached = self._dynamic_anchor_cache.get(sheet)
+        if cached is not None:
+            return cached
+
+        worksheet = self.excel.workbook[sheet]
+        sparse_cells = getattr(worksheet, '_cells', None)
+        if sparse_cells is not None:
+            cells = sparse_cells.values()
+        else:
+            cells = (opxl_cell for row in worksheet.iter_rows()
+                     for opxl_cell in row)
+
+        anchors = tuple(
+            str(AddressCell.create(opxl_cell.coordinate, sheet=sheet))
+            for opxl_cell in cells
+            if isinstance(opxl_cell.value, str) and
+            opxl_cell.value.startswith('=') and
+            'sequence(' in opxl_cell.value.lower()
+        )
+        self._dynamic_anchor_cache[sheet] = anchors
+        return anchors
+
+    @staticmethod
+    def _is_dynamic_formula(cell):
+        formula = cell.formula
+        if formula is None:
+            return False
+        source = formula.base_formula or formula.python_code or ''
+        return 'sequence(' in source.lower()
+
+    def _note_cell_value_set(self, cell, address):
+        """Maintain spill invariants after a direct set_value()"""
+        if not isinstance(cell, _Cell):
+            return
+
+        address = str(cell.address)
+
+        if address in self.spill_map or cell.spill_shape is not None:
+            # writing the anchor itself releases the spill, the anchor
+            # just holds the written value
+            self._clear_spill(cell)
+            cell.spill_shape = None
+            return
+
+        # writing into a currently spilled cell turns it into user data,
+        # i.e. an obstacle for the anchor
+        owner = self.spill_owners.pop(address, None)
+        if owner is not None:
+            cell.spill_owner = None
+            remaining = tuple(
+                a for a in self.spill_map.get(owner, ()) if a != address)
+            if remaining:
+                self.spill_map[owner] = remaining
+            else:
+                self.spill_map.pop(owner, None)
+
+        # re-evaluate anchors whose (possibly blocked) spill covers here,
+        # this both creates the #SPILL! and restores it when cleared
+        for anchor_addr in self._anchors_covering(cell.address):
+            anchor_cell = self.cell_map.get(anchor_addr)
+            if anchor_cell is None:
+                continue
+            if not anchor_cell.needs_calc:
+                self._reset(anchor_cell)
+            if anchor_cell.needs_calc:
+                self._evaluate(anchor_addr)
+
+    def _anchors_covering(self, target):
+        anchors = []
+        for anchor_addr, anchor_cell in self.cell_map.items():
+            if not isinstance(anchor_cell, _Cell):
+                continue
+            shape = anchor_cell.spill_shape
+            if not shape:
+                continue
+            address = anchor_cell.address
+            if address.sheet != target.sheet:
+                continue
+            nrows, ncols = shape
+            within_rows = address.row <= target.row <= address.row + nrows - 1
+            within_cols = (
+                address.col_idx <= target.col_idx <= address.col_idx + ncols - 1)
+            if within_rows and within_cols:
+                anchors.append(anchor_addr)
+        return tuple(anchors)
+
+    def _restore_spills(self, saved):
+        """Restore spill ownership after loading a serialized compiler"""
+        # evaluation during graph construction may already have spilled,
+        # reset that bookkeeping before recreating it from saved data
+        for spilled in self.spill_map.values():
+            for target_addr in spilled:
+                target_cell = self.cell_map.get(target_addr)
+                if target_cell is not None:
+                    target_cell.spill_owner = None
+        self.spill_map = {}
+        self.spill_owners = {}
+
+        if not saved:
+            return
+
+        for anchor_addr, spilled in saved.items():
+            anchor_cell = self.cell_map.get(anchor_addr)
+            if anchor_cell is None or anchor_cell.formula is None:
+                continue
+
+            owners = []
+            max_row_off = max_col_off = 0
+            anchor_row = anchor_cell.address.row
+            anchor_col = anchor_cell.address.col_idx
+            for target_addr in spilled:
+                target_cell = self.cell_map.get(target_addr)
+                if target_cell is None:
+                    continue
+                target_cell.spill_owner = anchor_addr
+                self.spill_owners[target_addr] = anchor_addr
+                owners.append(target_addr)
+                max_row_off = max(
+                    max_row_off, target_cell.address.row - anchor_row)
+                max_col_off = max(
+                    max_col_off, target_cell.address.col_idx - anchor_col)
+
+            if owners:
+                self.spill_map[anchor_addr] = tuple(owners)
+                anchor_cell.spill_shape = (max_row_off + 1, max_col_off + 1)
 
     def _evaluate_non_iterative(self, address):
         """ evaluate a cell or cells in the spreadsheet
@@ -1016,6 +1387,12 @@ class ExcelCompiler:
 class _CellBase:
 
     value = None
+
+    # dynamic array bookkeeping:
+    #  spill_owner: anchor address spilling into this cell, if any
+    #  spill_shape: (rows, cols) of the last array produced by an anchor
+    spill_owner = None
+    spill_shape = None
 
     def __init__(self, address=None, formula='', excel=None):
         formula_is_python_code = excel is None or isinstance(

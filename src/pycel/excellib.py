@@ -316,6 +316,55 @@ def sign(value):
     return -1 if value < 0 else int(bool(value))
 
 
+def _sequence_scalar_number(value):
+    # error strings propagate, everything non numeric is a #VALUE!
+    if isinstance(value, str):
+        return value if value in ERROR_CODES else VALUE_ERROR
+    if isinstance(value, bool):
+        return int(value)
+    if isinstance(value, (int, float)):
+        return value
+    return VALUE_ERROR
+
+
+def sequence(rows, columns=1, start=1, step=1):
+    # Excel reference: https://support.microsoft.com/en-us/office/
+    #   sequence-function-57467a98-57e0-4817-9f14-2eb78519ca90
+    #
+    # SEQUENCE(rows, [columns], [start], [step]) generates a list of
+    # sequential numbers, filled row by row.  A multi cell result is
+    # returned as a nested tuple which the compiler spills to the cells
+    # right of and below the formula's anchor cell.
+
+    # omitted optional arguments default to 1
+    columns = 1 if columns is None else columns
+    start = 1 if start is None else start
+    step = 1 if step is None else step
+
+    checked = tuple(_sequence_scalar_number(a) for a in (rows, columns, start, step))
+    error = next((a for a in checked if isinstance(a, str)), None)
+    if error is not None:
+        return error
+
+    rows, columns, start, step = checked
+
+    # fractional sizes are truncated, anything below 1 is a #VALUE!
+    rows = int(rows)
+    columns = int(columns)
+    if rows < 1 or columns < 1:
+        return VALUE_ERROR
+
+    values = []
+    element_number = 0
+    for _ in range(rows):
+        row_values = []
+        for _ in range(columns):
+            row_values.append(start + element_number * step)
+            element_number += 1
+        values.append(tuple(row_values))
+    return tuple(values)
+
+
 def sum_(*args):
     data = _numerics(*args)
     if isinstance(data, str):

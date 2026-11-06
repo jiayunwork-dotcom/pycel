@@ -22,7 +22,11 @@ from openpyxl.utils import (
 )
 
 
-ERROR_CODES = frozenset(Tokenizer.ERROR_CODES)
+# Dynamic array functions (e.g. SEQUENCE) can spill.  '#SPILL!' was added
+# to the Excel error family with dynamic arrays, and some openpyxl versions
+# do not list it in Tokenizer.ERROR_CODES yet.
+SPILL_ERROR = '#SPILL!'
+ERROR_CODES = frozenset(Tokenizer.ERROR_CODES) | {SPILL_ERROR}
 DIV0 = '#DIV/0!'
 EMPTY = '#EMPTY!'
 VALUE_ERROR = '#VALUE!'
